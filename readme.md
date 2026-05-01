@@ -1,5 +1,6 @@
 # Policy Copilot RAG
-
+![first page](image-1.png)
+![prompt](image.png)
 A retrieval-augmented assistant for answering employee policy, onboarding, and internal process questions with grounded context from internal PDF documents. The app uses LangChain Expression Language (LCEL) for streaming RAG inference, Chroma for persistent vector storage, BM25 plus dense retrieval for hybrid search, and Streamlit for the chat interface. [web:801][web:810]
 
 ## Overview
