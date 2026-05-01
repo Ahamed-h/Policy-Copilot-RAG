@@ -153,5 +153,5 @@ These questions help verify leave-policy retrieval, handbook retrieval, and cond
 - If you use Streamlit file upload instead of local PDFs later, PDF loaders often need a temporary file path rather than the in-memory upload object directly. [web:805][web:808]
 
 ## Screenshot
-
-![Policy Copilot UI](./assets/snap1.png)
+![first page](./assets/main.png)
+![prompt](./assets/first_page.png)
