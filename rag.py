@@ -1,129 +1,126 @@
 import os
-import chromadb
-import streamlit as st
-
-from langchain_community.document_loaders import HuggingFaceDatasetLoader, PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter, CharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS, Chroma
-
-from langchain.chains import RetrievalQA
-from langchain_community.llms import LlamaCpp
+from langchain_community.vectorstores import Chroma
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
-from langchain.callbacks.base import BaseCallbackHandler
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+from langchain_core.documents import Document
+from sentence_transformers import CrossEncoder
 
-################### for streaming in Streamlit without LECL ###################
-class StreamHandler(BaseCallbackHandler):
-    def __init__(self, container, initial_text=""):
-        self.container = container
-        self.text = initial_text
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PERSIST_DIRECTORY = os.path.join(BASE_DIR, "vector_stores")
+COLLECTION_NAME = "policy_copilot"
 
-    def on_llm_new_token(self, token: str, **kwargs) -> None:
-        self.text += token
-        self.container.markdown(self.text)
-# stream_handler = StreamHandler(st.empty())
-""" if you want to use streaming on your streamlit app, it's tricky to seperate model script \n
-and streamlit script if not using LECL, because llm will have to use 'streaming=True' \n
-and 'callbacks=[stream_handler]' and streamhandler uses st.empty() placeholder here which can't be first streamlit command. 
-"""
-               
-####################### Data processing for vectorstore #################################
-pdf_folder_path = "./data_source"
-documents = []
+# --- Initialization ---
+_embeddings = None
+_vectordb = None
+_hybrid_retriever = None
 
-for file in os.listdir(pdf_folder_path):
-    if file.endswith('.pdf'):
-        pdf_path = os.path.join(pdf_folder_path,file)
-        loader = PyPDFLoader(pdf_path)
-        documents.extend(loader.load())
+def get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True}
+        )
+    return _embeddings
 
-text_splitter_rc = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-chunked_documents_rc = text_splitter_rc.split_documents(documents)
+def get_vectordb():
+    global _vectordb
+    if _vectordb is None:
+        _vectordb = Chroma(
+            persist_directory=PERSIST_DIRECTORY,
+            embedding_function=get_embeddings(),
+            collection_name=COLLECTION_NAME
+        )
+    return _vectordb
 
-####################### EMBEDDINGS #################################
-model_path = "sentence-transformers/all-MiniLM-L6-v2"
-model_kwargs = {'device': 'mps'}
-encode_kwargs = {'normalize_embeddings': False}
-persist_directory="./vector_stores"
+def get_hybrid_retriever():
+    global _hybrid_retriever
+    if _hybrid_retriever is None:
+        raw = get_vectordb().get(include=["documents", "metadatas"])
+        docs = [Document(page_content=t, metadata=m or {}) for t, m in zip(raw.get("documents", []), raw.get("metadatas", []))]
+        
+        bm25 = BM25Retriever.from_documents(docs); bm25.k = 12
+        dense = get_vectordb().as_retriever(search_kwargs={"k": 12})
+        _hybrid_retriever = EnsembleRetriever(retrievers=[bm25, dense], weights=[0.5, 0.5])
+    return _hybrid_retriever
 
-if not os.path.exists(persist_directory):
-    os.makedirs(persist_directory)
+# --- Retrieval Logic ---
+def rerank_docs(query, docs, top_n=5):
+    if not docs: return []
+    scores = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2").predict([(query, d.page_content) for d in docs])
+    return [d for d, s in sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)[:top_n]]
+
+def retrieve_and_format(query: str):
+    # 1. Hybrid Retrieval
+    docs = get_hybrid_retriever().invoke(query)
+    
+    # 2. Domain Detection for Inclusive Filtering
+    q = query.lower()
+    domains = {"leave": ["leave", "paternity"], "conduct": ["conduct", "gift"], "handbook": ["probation", "onboarding"]}
+    active_filters = [d for d, kws in domains.items() if any(k in q for k in kws)]
+    
+    # Apply filter only if single domain detected, otherwise return all
+    if len(active_filters) == 1:
+        docs = [d for d in docs if d.metadata.get("policy_type") == active_filters[0]] or docs
+        
+    # 3. Reranking for Precision
+    top_docs = rerank_docs(query, docs, top_n=8)
+    return "\n\n".join([f"Source: {d.metadata.get('source_file')}\n{d.page_content}" for d in top_docs])
+
+# --- Chain ---
+import os
+import streamlit as st
 
 
-embeddings = HuggingFaceEmbeddings(
-    model_name=model_path,
-    model_kwargs=model_kwargs,
-    encode_kwargs=encode_kwargs
-)
+def get_chain():
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
+    if not api_key:
+        try:
+            api_key = st.secrets.get("GOOGLE_API_KEY") or st.secrets.get("GEMINI_API_KEY")
+        except Exception:
+            api_key = None
 
-def format_docs(docs):
-    return "\n\n".join([doc.page_content for doc in docs])
+    if not api_key:
+        raise ValueError(
+            "CRITICAL: API Key not found. Please set 'GOOGLE_API_KEY' "
+            "in your environment variables or in Streamlit Secrets."
+        )
 
-############################################## RAG ########################################################
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=api_key,
+        temperature=0
+    )
 
-########## Creating prompt ##########
-prompt_template = """Use the following pieces of context regarding titanic ship to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.
+    prompt = PromptTemplate.from_template("""
+You are Policy Copilot. Answer based ONLY on the context.
+Rules:
+- Be concise and grounded.
+- If the answer is not in the context, say: "I do not know based on the provided documents."
+- List items clearly when useful.
+- If the source text contains blanks like "_____", say the information is missing in the document.
+- Do not say the user sent an empty message unless the question is actually empty.
 
+Context:
 {context}
 
-Question: {question}
-Helpful Answer:
-"""
+Question:
+{question}
 
-prompt = PromptTemplate(template=prompt_template, input_variables=['context', 'question'])
+Answer:
+""")
 
-########## VectorDB creation and saving to disk ##########
-client = chromadb.Client()
-
-persist_directory="/Users/raunakanand/Documents/Work_R/llm0/vector_stores"
-vectordb = Chroma.from_documents(
-    documents=chunked_documents_rc,
-    embedding=embeddings,
-    persist_directory=persist_directory,
-    collection_name='chroma1'
-)
-vectordb.persist()
-
-########## VectorDB -loading from disk ##########
-vectordb = Chroma(persist_directory=persist_directory, embedding_function=embeddings, collection_name='chroma1')
-retriever = vectordb.as_retriever(search_kwargs={"k": 3})
-
-
-n_gpu_layers = 1
-n_batch = 512
-
-llm = LlamaCpp(
-    model_path="/Users/raunakanand/Documents/Work_R/llm_models/mistral-7b-v0.1.Q4_K_S.gguf",
-    n_gpu_layers=n_gpu_layers,
-    n_batch=n_batch,
-    n_ctx=1024,
-    f16_kv=True,
-    verbose=True,
-    # streaming=True,
-    # callbacks=[stream_handler]
-    # callbacks=[StreamingStdOutCallbackHandler()]
-)
-
-########## use when using RetrievalQA chain from llm's chain ##########
-qa = RetrievalQA.from_chain_type(llm=llm, chain_type='stuff',
-                                 retriever=retriever,
-                                #  return_source_documents=True,
-                                 chain_type_kwargs={'prompt': prompt},
-                                 verbose=False)
-
-########## RAG's chain in langchain's LECL format ##########
-rag_chain = ({"context": retriever | format_docs, "question": RunnablePassthrough()} | 
-             prompt | llm | StrOutputParser())
-
-def inference(query: str):
-    # return qa.invoke(query)['result']
-    # return qa.run(query)
-    return rag_chain.stream(query)
-
-
-
-
+    return (
+        {"context": retrieve_and_format, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+def inference(query: str): return get_chain().stream(query)
